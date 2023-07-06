@@ -1,5 +1,9 @@
 import numpy as np
 
+"""
+和pettingzoo.mpe基本完全一致
+"""
+
 # physical/external base state of all entites
 class EntityState(object):
     def __init__(self):

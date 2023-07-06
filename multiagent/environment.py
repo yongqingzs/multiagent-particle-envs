@@ -4,9 +4,56 @@ from gym.envs.registration import EnvSpec
 import numpy as np
 from multiagent.multi_discrete import MultiDiscrete
 
-# environment for all agents in the multiagent world
-# currently code assumes that no agents will be created/destroyed at runtime!
+"""
+mae -> mae_from_openai:
+1. 更改space
+- 不再是dict的形式，根据agent的顺序改为list的形式
+- 名称改为act_space和obs_space
+- 暂不采用MultiDiscrete
+2. 更改step:
+- 外部action以action_n作为输入，不再一个个输入(parallel)
+- 不再有last，重新与step进行合并(输出四个量)
+- 不再有dead_agent
+3. 不更改agents:
+- 在mae_from_openai中，agents依旧指代agent.name
+4. 更改reset:
+- reset需要返回obs_n
+- 因为每次step前都会把obs_n, reward_n, done_n, info_n进行清空，
+所以不需要在reset中进行清空
+- reset主要进行: reset(world) √、reset(render) X、返回obs_n √
+5. _set_actions:
+- 仍然用原来的形式，这里action=None只会在core中进行处理
+6. _get_obs等几个函数:
+- 只在获取step、reset返回值时候出现，因此不需要实现
+"""
+
+
 class MultiAgentEnv(gym.Env):
+    """
+    Environment for all agents in the multiagent world
+    currently code assumes that no agents will be created/destroyed at runtime!
+        
+    atr:
+    1. self.agents: 这里代表Agent实体，而pettingzoo中是AgentID(dif)
+    - 因此，以下agents均指代self.agents
+    - TODO: 在mae_openai中应该不用进行替换，仍然采用AgentID
+    2. _callback: 由外部scenarios传入(dif)
+    - TODO: 是否能像pettingzoo中一样用一个scenario替代传入
+    - 这些_callback在scenario中其实是scenario.observation这种属性
+    3. discrete_action_input: 决定动作是one-hot形式还是num形式
+    - 默认false为one-hot
+    - TODO: one-hot既可以作为连续动作也可以作为离散动作，如果force_为True则进行处理变为离散的形式
+    (数值最大的那一位设置为1)
+    4. force_discrete_action: 如果为true，那么即使是连续输入也会用离散运行
+    5. world.collaborative/discrete_action: 在core.world中并不存在该属性，
+    应该是在外部scenario中添加 
+    6. action_space/obs_space: 指所有agents的总体space, 均采用list进行表示
+    - 在pettingzoo中用spaces表示总体(dif)，TODO: 这里是否要进行修改
+    - 按照agents的顺序传入进行spaces的初始化，pettingzoo中则是用dict表示spaces(dif)
+    - 如果action_space均为离散，则用MultiDiscrete进行总体表示，TODO: 这里是否要进行修改
+    - 连续action_shape: 2，离散action_shape: 5(dif: pettingzoo中均为5)
+    """
+
     metadata = {
         'render.modes' : ['human', 'rgb_array']
     }
@@ -16,9 +63,9 @@ class MultiAgentEnv(gym.Env):
                  done_callback=None, shared_viewer=True):
 
         self.world = world
-        self.agents = self.world.policy_agents
+        self.agents = self.world.policy_agents  # 意义和pettingzoo不一致
         # set required vectorized gym env property
-        self.n = len(world.policy_agents)
+        self.n = len(world.policy_agents)  # TODO
         # scenario callbacks
         self.reset_callback = reset_callback
         self.reward_callback = reward_callback
@@ -26,9 +73,9 @@ class MultiAgentEnv(gym.Env):
         self.info_callback = info_callback
         self.done_callback = done_callback
         # environment parameters
-        self.discrete_action_space = True
+        self.discrete_action_space = True  # 为True，则为离散动作空间
         # if true, action is a number 0...N, otherwise action is a one-hot N-dimensional vector
-        self.discrete_action_input = False
+        self.discrete_action_input = False  # TODO: 这个属性是否要在mae_openai中添加
         # if true, even the action is continuous, action will be performed discretely
         self.force_discrete_action = world.discrete_action if hasattr(world, 'discrete_action') else False
         # if true, every agent has the same reward
@@ -39,10 +86,10 @@ class MultiAgentEnv(gym.Env):
         self.action_space = []
         self.observation_space = []
         for agent in self.agents:
-            total_action_space = []
+            total_action_space = []  # 每个agent循环都会进行清空
             # physical action space
             if self.discrete_action_space:
-                u_action_space = spaces.Discrete(world.dim_p * 2 + 1)
+                u_action_space = spaces.Discrete(world.dim_p * 2 + 1)  # dim_p=2
             else:
                 u_action_space = spaces.Box(low=-agent.u_range, high=+agent.u_range, shape=(world.dim_p,), dtype=np.float32)
             if agent.movable:
@@ -67,7 +114,7 @@ class MultiAgentEnv(gym.Env):
             # observation space
             obs_dim = len(observation_callback(agent, self.world))
             self.observation_space.append(spaces.Box(low=-np.inf, high=+np.inf, shape=(obs_dim,), dtype=np.float32))
-            agent.action.c = np.zeros(self.world.dim_c)
+            agent.action.c = np.zeros(self.world.dim_c)  # pettingzoo中在_set_action中进行初始化
 
         # rendering
         self.shared_viewer = shared_viewer
@@ -78,11 +125,25 @@ class MultiAgentEnv(gym.Env):
         self._reset_render()
 
     def step(self, action_n):
+        """
+        步骤:
+        1. 再次赋值agents(可能没有意义)
+                |
+        2. 将外部action一起传入，然后通过循环进行set_action
+                |
+        3. 进行world.step()
+                |
+        4. 获取obs_n, reward_n, done_n, info_n
+
+        NOTE:
+        1. TODO: done从scenario中来，但在make_env时发现没有done_callback输入
+        - 也就是说openai_mpe会一直运行，除非训练结束
+        """
         obs_n = []
         reward_n = []
         done_n = []
         info_n = {'n': []}
-        self.agents = self.world.policy_agents
+        self.agents = self.world.policy_agents  # ?
         # set action for each agent
         for i, agent in enumerate(self.agents):
             self._set_action(action_n[i], agent, self.action_space[i])
@@ -142,9 +203,25 @@ class MultiAgentEnv(gym.Env):
 
     # set env action for a particular agent
     def _set_action(self, action, agent, action_space, time=None):
+        """
+        atr:
+        1. discrete_action_input: 决定动作是one-hot形式还是num形式
+        - 默认false为one-hot
+        - TODO: one-hot既可以作为连续动作也可以作为离散动作，如果force_为True则进行处理变为离散的形式
+        (数值最大的那一位设置为1)
+        2. force_discrete_action: 如果为true，那么即使是连续输入也会用离散运行
+
+        NOTE:
+        1. __init__的时候进行过一次agent.action.c = np.zeros(self.world.dim_c)，
+        因此初始化的那次并无意义
+        2. 输入参数中的action_space似乎只在MultiDiscrete时有用
+        3. ! 离散动作输入和离散动作空间不是一回事
+        4. ! 和pettingzoo.mpe不一样，不会对action=None进行处理
+        """
         agent.action.u = np.zeros(self.world.dim_p)
         agent.action.c = np.zeros(self.world.dim_c)
         # process action
+        # 判断MultiDiscrete
         if isinstance(action_space, MultiDiscrete):
             act = []
             size = action_space.high - action_space.low + 1
@@ -158,22 +235,23 @@ class MultiAgentEnv(gym.Env):
 
         if agent.movable:
             # physical action
-            if self.discrete_action_input:
+            if self.discrete_action_input:  # num
                 agent.action.u = np.zeros(self.world.dim_p)
                 # process discrete action
                 if action[0] == 1: agent.action.u[0] = -1.0
                 if action[0] == 2: agent.action.u[0] = +1.0
                 if action[0] == 3: agent.action.u[1] = -1.0
                 if action[0] == 4: agent.action.u[1] = +1.0
-            else:
-                if self.force_discrete_action:
+            else:  # one-hot
+                if self.force_discrete_action:  # 如果force_为true，则处理为离散形式
                     d = np.argmax(action[0])
                     action[0][:] = 0.0
-                    action[0][d] = 1.0
-                if self.discrete_action_space:
+                    action[0][d] = 1.0  # 将动作中概率最大的一位设置为1，相当于变为离散动作
+                if self.discrete_action_space:  # 离散动作空间
+                    # 在pettingzoo中连续动作就是这么处理的，?
                     agent.action.u[0] += action[0][1] - action[0][2]
                     agent.action.u[1] += action[0][3] - action[0][4]
-                else:
+                else:  # 连续动作空间
                     agent.action.u = action[0]
             sensitivity = 5.0
             if agent.accel is not None:
